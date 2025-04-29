@@ -11,8 +11,8 @@ function show_help {
     echo "Updates certificates stored by the Venafi PKI plugin in HashiCorp Vault."
     echo
     echo "Options:"
-    echo "  -c, --cert FILE       Certificate file in PEM format (required)"
-    echo "  -k, --key FILE        Private key file in PEM format (required)"
+    echo "  -c, --cert FILE       Certificate file in PEM format (required for update)"
+    echo "  -k, --key FILE        Private key file in PEM format (required for update)"
     echo "  -C, --chain FILE      Certificate chain file in PEM format"
     echo "  -i, --id STRING       Certificate UID to update (CN, serial, or hash)"
     echo "  -m, --mode STRING     Storage mode: cn, serial, hash (default: serial)"
@@ -21,15 +21,19 @@ function show_help {
     echo "  -a, --alt-names LIST  Comma-separated list of SANs (for hash mode)"
     echo "  -p, --path STRING     Path prefix in Vault (default: venafi-pki)"
     echo "  -d, --dry-run         Show what would be done without making changes"
+    echo "  -s, --show            Show current certificate content without updating"
     echo "  -h, --help            Display this help message"
     echo
     echo "Environment variables:"
     echo "  VAULT_ADDR            Vault server address (required)"
     echo "  VAULT_TOKEN           Vault authentication token (required)"
+    echo "  VAULT_NAMESPACE       Vault namespace (for Vault Enterprise)"
     echo
     echo "Examples:"
     echo "  $0 -c new-cert.pem -k new-key.pem -C chain.pem -i example.com -m cn"
     echo "  $0 -c new-cert.pem -k new-key.pem -i '00:11:22:33:44' -m serial"
+    echo "  $0 -i example.com -m cn -s                 # Show current certificate"
+    echo "  $0 -i '00:11:22:33:44' -m serial -s        # Show by serial number"
     echo
 }
 
@@ -43,6 +47,11 @@ function check_env_vars {
     if [ -z "$VAULT_TOKEN" ]; then
         echo "Error: VAULT_TOKEN environment variable is not set"
         exit 1
+    fi
+    
+    # Namespace is optional, but inform the user if it's being used
+    if [ -n "$VAULT_NAMESPACE" ]; then
+        echo "Using Vault namespace: $VAULT_NAMESPACE"
     fi
 }
 
@@ -91,6 +100,68 @@ function read_cert_file {
     cat "$file"
 }
 
+# Function to show a certificate from Vault
+function show_certificate {
+    local cert_uid="$1"
+    local mode="$2"
+    local path_prefix="$3"
+    
+    # Determine the path based on the mode
+    local storage_path="${path_prefix}/certs/$cert_uid"
+    
+    echo "Reading certificate with UID: $cert_uid"
+    echo "Storage mode: $mode"
+    echo "Storage path: $storage_path"
+    
+    # Read from Vault
+    echo "Reading certificate from Vault storage..."
+    local response=$(curl -s \
+         -H "X-Vault-Token: $VAULT_TOKEN" \
+         $([[ -n "$VAULT_NAMESPACE" ]] && echo "-H \"X-Vault-Namespace: $VAULT_NAMESPACE\"") \
+         "$VAULT_ADDR/v1/sys/raw/$storage_path")
+    
+    # Check if we got valid JSON
+    if ! echo "$response" | jq -e '.' >/dev/null 2>&1; then
+        echo "Error: Failed to retrieve certificate or invalid response"
+        echo "Response: $response"
+        exit 1
+    fi
+    
+    # Check if data exists
+    if ! echo "$response" | jq -e '.data.value' >/dev/null 2>&1; then
+        echo "Error: Certificate not found at path: $storage_path"
+        if [ -n "$VAULT_NAMESPACE" ]; then
+            echo "Ensure the namespace '$VAULT_NAMESPACE' is correct and that you have appropriate permissions."
+        fi
+        exit 1
+    fi
+    
+    # Display the certificate details
+    echo "Certificate retrieved from path: $storage_path"
+    echo
+    echo "Certificate Details:"
+    echo "===================="
+    
+    # Extract the certificate field and decode
+    local cert=$(echo "$response" | jq -r '.data.value.certificate' 2>/dev/null)
+    if [ -n "$cert" ] && [ "$cert" != "null" ]; then
+        echo "$cert" > /tmp/temp_cert.pem
+        echo "Subject: $(openssl x509 -in /tmp/temp_cert.pem -noout -subject 2>/dev/null || echo "Unable to parse certificate")"
+        echo "Issuer: $(openssl x509 -in /tmp/temp_cert.pem -noout -issuer 2>/dev/null || echo "Unable to parse certificate")"
+        echo "Serial Number: $(openssl x509 -in /tmp/temp_cert.pem -noout -serial 2>/dev/null | sed 's/serial=//' || echo "Unable to parse certificate")"
+        echo "Not Before: $(openssl x509 -in /tmp/temp_cert.pem -noout -startdate 2>/dev/null | sed 's/notBefore=//' || echo "Unable to parse certificate")"
+        echo "Not After: $(openssl x509 -in /tmp/temp_cert.pem -noout -enddate 2>/dev/null | sed 's/notAfter=//' || echo "Unable to parse certificate")"
+        echo "SAN: $(openssl x509 -in /tmp/temp_cert.pem -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -n1 | sed 's/^ *//' || echo "No SAN found")"
+        rm /tmp/temp_cert.pem
+    else
+        echo "Unable to extract certificate from response"
+    fi
+    
+    echo
+    echo "Raw Data:"
+    echo "$response" | jq '.data.value'
+}
+
 # Main function to update a certificate in Vault
 function update_certificate {
     local cert_content="$1"
@@ -119,7 +190,7 @@ EOF
 )
     
     # Determine the path based on the mode
-    local storage_path="certs/$cert_uid"
+    local storage_path="${path_prefix}/certs/$cert_uid"
     
     # Show what we're about to do
     echo "Updating certificate with UID: $cert_uid"
@@ -142,6 +213,7 @@ EOF
     curl -s \
          -H "X-Vault-Token: $VAULT_TOKEN" \
          -H "Content-Type: application/json" \
+         $([[ -n "$VAULT_NAMESPACE" ]] && echo "-H \"X-Vault-Namespace: $VAULT_NAMESPACE\"") \
          -X PUT \
          -d "{\"value\": $(echo "$json_payload" | jq -c .)}" \
          "$VAULT_ADDR/v1/sys/raw/$storage_path"
@@ -162,6 +234,7 @@ CN=""
 ALT_NAMES=""
 PATH_PREFIX="venafi-pki"
 DRY_RUN=false
+SHOW_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     key="$1"
@@ -206,6 +279,10 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        -s|--show)
+            SHOW_ONLY=true
+            shift
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -221,25 +298,6 @@ done
 # Validate required parameters
 check_env_vars
 
-if [ -z "$CERT_FILE" ]; then
-    echo "Error: Certificate file is required"
-    show_help
-    exit 1
-fi
-
-if [ -z "$KEY_FILE" ]; then
-    echo "Error: Private key file is required"
-    show_help
-    exit 1
-fi
-
-# If chain file is not provided, use an empty string
-if [ -z "$CHAIN_FILE" ]; then
-    CHAIN_CONTENT=""
-else
-    CHAIN_CONTENT=$(read_cert_file "$CHAIN_FILE")
-fi
-
 # Calculate certificate UID if not provided
 if [ -z "$CERT_UID" ]; then
     if [ "$MODE" = "cn" ]; then
@@ -249,6 +307,16 @@ if [ -z "$CERT_UID" ]; then
         fi
         CERT_UID="$CN"
     elif [ "$MODE" = "serial" ]; then
+        if [ "$SHOW_ONLY" = true ]; then
+            echo "Error: Certificate UID is required when mode is 'serial' and show option is used"
+            exit 1
+        fi
+        
+        if [ -z "$CERT_FILE" ]; then
+            echo "Error: Certificate file is required when mode is 'serial' and certificate UID is not provided"
+            exit 1
+        fi
+        
         CERT_CONTENT=$(read_cert_file "$CERT_FILE")
         temp_cert_file=$(mktemp)
         echo "$CERT_CONTENT" > "$temp_cert_file"
@@ -272,6 +340,33 @@ if [ -z "$CERT_UID" ]; then
     fi
     
     echo "Calculated certificate UID: $CERT_UID"
+fi
+
+# Show certificate if requested
+if [ "$SHOW_ONLY" = true ]; then
+    # Only show the certificate without updating
+    show_certificate "$CERT_UID" "$MODE" "$PATH_PREFIX"
+    exit 0
+fi
+
+# Validate required files for update
+if [ -z "$CERT_FILE" ]; then
+    echo "Error: Certificate file is required for update operation"
+    show_help
+    exit 1
+fi
+
+if [ -z "$KEY_FILE" ]; then
+    echo "Error: Private key file is required for update operation"
+    show_help
+    exit 1
+fi
+
+# If chain file is not provided, use an empty string
+if [ -z "$CHAIN_FILE" ]; then
+    CHAIN_CONTENT=""
+else
+    CHAIN_CONTENT=$(read_cert_file "$CHAIN_FILE")
 fi
 
 # Read certificate and key files
