@@ -29,7 +29,7 @@ Create a file named `namespace-pki-raw-restricted.hcl` with the following conten
 ```hcl
 # Allow access only to the specific PKI path in raw storage
 # Replace "your-namespace" with your actual namespace name
-path "sys/raw/your-namespace-pki/*" {
+path "sys/raw/+-pki/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
 }
 
